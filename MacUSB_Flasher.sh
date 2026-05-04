@@ -16,7 +16,8 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="1.0"
+VERSION="1.2"
+REPO_URL="https://raw.githubusercontent.com/sileade/MacUSB-Flasher/main/MacUSB_Flasher.sh"
 
 # --- Защита от запуска через sudo ---
 if [ "$EUID" -eq 0 ]; then
@@ -24,6 +25,39 @@ if [ "$EUID" -eq 0 ]; then
     echo "Скрипт сам запросит пароль, когда нужно."
     exit 1
 fi
+
+# --- Функция: Автообновление ---
+check_for_updates() {
+    echo -e "${BLUE}[*] Проверка обновлений...${NC}"
+    
+    # Скачиваем последнюю версию скрипта во временный файл
+    TMP_FILE="/tmp/MacUSB_Flasher_latest.sh"
+    if curl -s -f -o "$TMP_FILE" "$REPO_URL"; then
+        # Извлекаем версию из скачанного файла
+        LATEST_VERSION=$(grep -o 'VERSION="[0-9.]*"' "$TMP_FILE" | head -1 | cut -d'"' -f2)
+        
+        if [ -n "$LATEST_VERSION" ] && [ "$LATEST_VERSION" != "$VERSION" ]; then
+            echo -e "${GREEN}[!] Найдена новая версия: v${LATEST_VERSION} (текущая: v${VERSION})${NC}"
+            echo -e "${YELLOW}Обновление...${NC}"
+            
+            # Копируем новый скрипт поверх текущего
+            cp "$TMP_FILE" "$0"
+            chmod +x "$0"
+            
+            echo -e "${GREEN}[OK] Успешно обновлено! Перезапуск...${NC}"
+            sleep 1
+            
+            # Перезапускаем обновленный скрипт
+            exec "$0" "$@"
+        else
+            echo -e "${GREEN}[OK] У вас установлена последняя версия (v${VERSION}).${NC}"
+        fi
+    else
+        echo -e "${YELLOW}[!] Не удалось проверить обновления (нет интернета?). Пропускаем.${NC}"
+    fi
+    rm -f "$TMP_FILE"
+    echo ""
+}
 
 # --- Функция: Баннер ---
 show_banner() {
@@ -359,6 +393,7 @@ menu_arm() {
 
 # --- ГЛАВНОЕ МЕНЮ ---
 show_banner
+check_for_updates
 
 echo -e "${BOLD}Что вы хотите записать?${NC}"
 echo ""
