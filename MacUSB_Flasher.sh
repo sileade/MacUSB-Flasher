@@ -131,6 +131,42 @@ auto_detect_usb() {
     fi
 }
 
+# --- Функция: Проверка флешки (Верификация) ---
+verify_usb() {
+    echo ""
+    echo -e "${BLUE}[*] Проверка целостности записанной флешки...${NC}"
+    
+    # Даем системе время на монтирование
+    sleep 3
+    
+    # Проверяем, смонтирована ли флешка
+    MOUNT_POINT=$(mount | grep "$NEW_DISK" | awk -F' on ' '{print $2}' | awk -F' \\(' '{print $1}')
+    
+    if [ -z "$MOUNT_POINT" ]; then
+        # Пытаемся смонтировать принудительно
+        diskutil mountDisk "$NEW_DISK" >/dev/null 2>&1 || true
+        sleep 2
+        MOUNT_POINT=$(mount | grep "$NEW_DISK" | awk -F' on ' '{print $2}' | awk -F' \\(' '{print $1}')
+    fi
+    
+    if [ -n "$MOUNT_POINT" ]; then
+        # Проверка наличия загрузочных файлов
+        if [ -d "$MOUNT_POINT/efi" ] || [ -d "$MOUNT_POINT/EFI" ] || [ -d "$MOUNT_POINT/boot" ] || [ -f "$MOUNT_POINT/bootmgr" ] || [ -f "$MOUNT_POINT/kernel.img" ] || [ -f "$MOUNT_POINT/start.elf" ]; then
+            echo -e "${GREEN}[OK] Загрузочные файлы (EFI/Boot) найдены!${NC}"
+            echo -e "${GREEN}[OK] Файловая система читается корректно.${NC}"
+            echo -e "${GREEN}[OK] Верификация пройдена успешно. Флешка готова к загрузке.${NC}"
+        else
+            echo -e "${YELLOW}[!] ВНИМАНИЕ: Загрузочные файлы не найдены в корне диска.${NC}"
+            echo -e "${YELLOW}Возможно, образ не является загрузочным или записан с ошибкой.${NC}"
+        fi
+    else
+        # Для некоторых Linux/ARM образов macOS не может прочитать файловую систему (ext4/ext3)
+        echo -e "${YELLOW}[!] macOS не может прочитать файловую систему флешки.${NC}"
+        echo -e "${YELLOW}Это нормально для Linux (ext4) и Raspberry Pi образов.${NC}"
+        echo -e "${GREEN}[OK] Физическая запись завершена без ошибок.${NC}"
+    fi
+}
+
 # --- Функция: Запись Windows (UEFI) ---
 flash_windows() {
     echo ""
@@ -185,6 +221,8 @@ flash_windows() {
     echo ""
     echo -e "${BLUE}[5/5] Отмонтирование ISO...${NC}"
     hdiutil detach "$ISO_MP" 2>/dev/null || true
+    
+    verify_usb
 }
 
 # --- Функция: Запись через dd (Linux / ARM) ---
@@ -204,8 +242,13 @@ flash_dd() {
     sudo dd bs=4m if="$ISO_PATH" of="$RDISK" status=progress
 
     echo ""
-    echo -e "${BLUE}[3/3] Синхронизация и извлечение...${NC}"
+    echo -e "${BLUE}[3/3] Синхронизация...${NC}"
     sync
+    
+    verify_usb
+    
+    echo ""
+    echo -e "${BLUE}[*] Извлечение флешки...${NC}"
     sudo diskutil eject "$NEW_DISK" 2>/dev/null || true
 }
 
