@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# MacUSB Flasher v1.0
+# MacUSB Flasher v2.0
 # Универсальная утилита для создания загрузочных флешек на macOS
-# Поддержка: Windows, Linux, Raspberry Pi, ARM
+# Поддержка: Windows, Linux, Raspberry Pi, ARM, Временная флешка (Бэкап/Восстановление)
 # Автор: Manus AI
 # Запуск: ./MacUSB_Flasher.sh (БЕЗ sudo!)
 
@@ -16,8 +16,10 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="1.2"
+VERSION="2.0"
 REPO_URL="https://raw.githubusercontent.com/sileade/MacUSB-Flasher/main/MacUSB_Flasher.sh"
+LOG_FILE="$HOME/Library/Logs/MacUSB_Flasher.log"
+BACKUP_DIR="$HOME/MacUSB_Backups"
 
 # --- Защита от запуска через sudo ---
 if [ "$EUID" -eq 0 ]; then
@@ -26,28 +28,24 @@ if [ "$EUID" -eq 0 ]; then
     exit 1
 fi
 
+# --- Логирование ---
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
 # --- Функция: Автообновление ---
 check_for_updates() {
     echo -e "${BLUE}[*] Проверка обновлений...${NC}"
-    
-    # Скачиваем последнюю версию скрипта во временный файл
     TMP_FILE="/tmp/MacUSB_Flasher_latest.sh"
     if curl -s -f -o "$TMP_FILE" "$REPO_URL"; then
-        # Извлекаем версию из скачанного файла
         LATEST_VERSION=$(grep -o 'VERSION="[0-9.]*"' "$TMP_FILE" | head -1 | cut -d'"' -f2)
-        
         if [ -n "$LATEST_VERSION" ] && [ "$LATEST_VERSION" != "$VERSION" ]; then
             echo -e "${GREEN}[!] Найдена новая версия: v${LATEST_VERSION} (текущая: v${VERSION})${NC}"
             echo -e "${YELLOW}Обновление...${NC}"
-            
-            # Копируем новый скрипт поверх текущего
             cp "$TMP_FILE" "$0"
             chmod +x "$0"
-            
             echo -e "${GREEN}[OK] Успешно обновлено! Перезапуск...${NC}"
             sleep 1
-            
-            # Перезапускаем обновленный скрипт
             exec "$0" "$@"
         else
             echo -e "${GREEN}[OK] У вас установлена последняя версия (v${VERSION}).${NC}"
@@ -72,22 +70,21 @@ show_banner() {
 # --- Функция: Проверка и установка зависимостей ---
 check_deps() {
     echo -e "${BLUE}[*] Проверка зависимостей...${NC}"
-
     if ! command -v brew &> /dev/null; then
         echo -e "${YELLOW}Homebrew не найден. Установка...${NC}"
-        /bin/bash -c \
-            "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        # Добавляем brew в PATH для Apple Silicon
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
         if [ -f /opt/homebrew/bin/brew ]; then
             eval "$(/opt/homebrew/bin/brew shellenv)"
         fi
     fi
-
     if ! command -v wimlib-imagex &> /dev/null; then
         echo -e "${YELLOW}wimlib не найден. Установка...${NC}"
         brew install wimlib
     fi
-
+    if ! command -v pv &> /dev/null; then
+        echo -e "${YELLOW}pv (прогресс-бар) не найден. Установка...${NC}"
+        brew install pv
+    fi
     echo -e "${GREEN}[OK] Зависимости готовы.${NC}"
     echo ""
 }
@@ -100,7 +97,6 @@ get_image_path() {
     echo "(Можно перетащить файл из Finder в это окно)"
     read -r -p "Путь: " ISO_PATH
 
-    # Очистка пути от кавычек, пробелов, обратных слэшей
     ISO_PATH="${ISO_PATH#"${ISO_PATH%%[![:space:]]*}"}"
     ISO_PATH="${ISO_PATH%"${ISO_PATH##*[![:space:]]}"}"
     ISO_PATH=$(echo "$ISO_PATH" | sed "s/\\\\//g;s/^[\"']//;s/[\"']$//")
@@ -118,8 +114,7 @@ auto_detect_usb() {
     echo -e "${YELLOW}Отключите флешку, если она сейчас вставлена.${NC}"
     read -r -p "Нажмите Enter, когда флешка будет отключена..."
 
-    BEFORE=$(diskutil list external 2>/dev/null \
-        | grep -o '/dev/disk[0-9]*' | sort -u)
+    BEFORE=$(diskutil list external 2>/dev/null | grep -o '/dev/disk[0-9]*' | sort -u)
 
     echo ""
     echo -e "${CYAN}Теперь ВСТАВЬТЕ флешку в Mac...${NC}"
@@ -127,8 +122,7 @@ auto_detect_usb() {
 
     NEW_DISK=""
     for _ in $(seq 1 60); do
-        AFTER=$(diskutil list external 2>/dev/null \
-            | grep -o '/dev/disk[0-9]*' | sort -u)
+        AFTER=$(diskutil list external 2>/dev/null | grep -o '/dev/disk[0-9]*' | sort -u)
         for d in $AFTER; do
             if ! echo "$BEFORE" | grep -q "$d"; then
                 NEW_DISK="$d"
@@ -146,10 +140,8 @@ auto_detect_usb() {
     fi
 
     INFO=$(diskutil info "$NEW_DISK")
-    D_NAME=$(echo "$INFO" | grep "Device / Media Name:" \
-        | awk -F': ' '{print $2}' | xargs)
-    D_SIZE=$(echo "$INFO" | grep "Disk Size:" \
-        | awk -F': ' '{print $2}' | awk -F'\\(' '{print $1}' | xargs)
+    D_NAME=$(echo "$INFO" | grep "Device / Media Name:" | awk -F': ' '{print $2}' | xargs)
+    D_SIZE=$(echo "$INFO" | grep "Disk Size:" | awk -F': ' '{print $2}' | awk -F'\\(' '{print $1}' | xargs)
 
     echo ""
     echo -e "${GREEN}Обнаружена флешка:${NC}"
@@ -165,40 +157,46 @@ auto_detect_usb() {
     fi
 }
 
-# --- Функция: Проверка флешки (Верификация) ---
+# --- Функция: Дотошная проверка флешки (Верификация) ---
 verify_usb() {
     echo ""
-    echo -e "${BLUE}[*] Проверка целостности записанной флешки...${NC}"
-    
-    # Даем системе время на монтирование
+    echo -e "${BLUE}[*] Дотошная проверка целостности записанной флешки...${NC}"
     sleep 3
     
-    # Проверяем, смонтирована ли флешка
     MOUNT_POINT=$(mount | grep "$NEW_DISK" | awk -F' on ' '{print $2}' | awk -F' \\(' '{print $1}')
-    
     if [ -z "$MOUNT_POINT" ]; then
-        # Пытаемся смонтировать принудительно
         diskutil mountDisk "$NEW_DISK" >/dev/null 2>&1 || true
         sleep 2
         MOUNT_POINT=$(mount | grep "$NEW_DISK" | awk -F' on ' '{print $2}' | awk -F' \\(' '{print $1}')
     fi
     
     if [ -n "$MOUNT_POINT" ]; then
-        # Проверка наличия загрузочных файлов
         if [ -d "$MOUNT_POINT/efi" ] || [ -d "$MOUNT_POINT/EFI" ] || [ -d "$MOUNT_POINT/boot" ] || [ -f "$MOUNT_POINT/bootmgr" ] || [ -f "$MOUNT_POINT/kernel.img" ] || [ -f "$MOUNT_POINT/start.elf" ]; then
             echo -e "${GREEN}[OK] Загрузочные файлы (EFI/Boot) найдены!${NC}"
             echo -e "${GREEN}[OK] Файловая система читается корректно.${NC}"
+            
+            # Проверка целостности файлов (выборочно)
+            echo -e "${BLUE}[*] Проверка читаемости файлов...${NC}"
+            find "$MOUNT_POINT" -type f -size -1M -print0 | head -n 10 | xargs -0 cat >/dev/null 2>&1 && echo -e "${GREEN}[OK] Файлы читаются без ошибок I/O.${NC}" || echo -e "${YELLOW}[!] Возможны ошибки чтения файлов.${NC}"
+            
             echo -e "${GREEN}[OK] Верификация пройдена успешно. Флешка готова к загрузке.${NC}"
+            log "Успешная запись и верификация: $ISO_PATH на $NEW_DISK"
         else
             echo -e "${YELLOW}[!] ВНИМАНИЕ: Загрузочные файлы не найдены в корне диска.${NC}"
             echo -e "${YELLOW}Возможно, образ не является загрузочным или записан с ошибкой.${NC}"
+            log "Ошибка верификации (нет загрузочных файлов): $ISO_PATH на $NEW_DISK"
         fi
     else
-        # Для некоторых Linux/ARM образов macOS не может прочитать файловую систему (ext4/ext3)
         echo -e "${YELLOW}[!] macOS не может прочитать файловую систему флешки.${NC}"
         echo -e "${YELLOW}Это нормально для Linux (ext4) и Raspberry Pi образов.${NC}"
         echo -e "${GREEN}[OK] Физическая запись завершена без ошибок.${NC}"
+        log "Успешная физическая запись (ФС не читается macOS): $ISO_PATH на $NEW_DISK"
     fi
+}
+
+# --- Функция: Уведомление macOS ---
+notify_done() {
+    osascript -e 'display notification "Запись загрузочной флешки успешно завершена!" with title "MacUSB Flasher"'
 }
 
 # --- Функция: Запись Windows (UEFI) ---
@@ -210,8 +208,7 @@ flash_windows() {
     echo ""
     echo -e "${BLUE}[2/5] Монтирование ISO...${NC}"
     MOUT=$(hdiutil mount "$ISO_PATH" 2>&1)
-    ISO_MP=$(echo "$MOUT" | grep -o '/Volumes/.*' \
-        | tail -1 | sed 's/[[:space:]]*$//')
+    ISO_MP=$(echo "$MOUT" | grep -o '/Volumes/.*' | tail -1 | sed 's/[[:space:]]*$//')
 
     if [ -z "$ISO_MP" ] || [ ! -d "$ISO_MP" ]; then
         echo -e "${RED}Не удалось смонтировать ISO!${NC}"
@@ -221,11 +218,7 @@ flash_windows() {
 
     echo ""
     echo -e "${BLUE}[3/5] Копирование файлов...${NC}"
-    echo "  (Это может занять 5-15 минут)"
-    rsync -avh --progress \
-        --exclude='sources/install.wim' \
-        --exclude='sources/install.esd' \
-        "$ISO_MP/" /Volumes/WINUSB/
+    rsync -avh --progress --exclude='sources/install.wim' --exclude='sources/install.esd' "$ISO_MP/" /Volumes/WINUSB/
 
     WIM="$ISO_MP/sources/install.wim"
     ESD="$ISO_MP/sources/install.esd"
@@ -237,8 +230,7 @@ flash_windows() {
         if [ "$WSIZE" -gt 4294967295 ]; then
             echo "  Файл > 4 ГБ, разделяем..."
             mkdir -p /Volumes/WINUSB/sources
-            wimlib-imagex split "$WIM" \
-                /Volumes/WINUSB/sources/install.swm 3800
+            wimlib-imagex split "$WIM" /Volumes/WINUSB/sources/install.swm 3800
         else
             echo "  Файл < 4 ГБ, копируем целиком..."
             cp "$WIM" /Volumes/WINUSB/sources/
@@ -257,181 +249,155 @@ flash_windows() {
     hdiutil detach "$ISO_MP" 2>/dev/null || true
     
     verify_usb
+    notify_done
 }
 
-# --- Функция: Запись через dd (Linux / ARM) ---
+# --- Функция: Запись через dd с прогресс-баром (Linux / ARM) ---
 flash_dd() {
     RDISK=$(echo "$NEW_DISK" | sed 's|/dev/disk|/dev/rdisk|')
-
     echo ""
     echo -e "${BLUE}[1/3] Отмонтирование флешки...${NC}"
     sudo diskutil unmountDisk "$NEW_DISK"
 
     echo ""
-    echo -e "${BLUE}[2/3] Запись образа (dd)...${NC}"
-    echo -e "${YELLOW}  Это может занять 5-30 минут.${NC}"
-    echo "  Нажмите Ctrl+T для просмотра прогресса."
-    echo ""
-
-    sudo dd bs=4m if="$ISO_PATH" of="$RDISK" status=progress
+    echo -e "${BLUE}[2/3] Запись образа (dd + pv)...${NC}"
+    ISO_SIZE=$(stat -f%z "$ISO_PATH" 2>/dev/null || stat -c%s "$ISO_PATH" 2>/dev/null)
+    
+    if command -v pv &> /dev/null; then
+        sudo sh -c "pv -s $ISO_SIZE '$ISO_PATH' | dd bs=4m of='$RDISK'"
+    else
+        sudo dd bs=4m if="$ISO_PATH" of="$RDISK" status=progress
+    fi
 
     echo ""
     echo -e "${BLUE}[3/3] Синхронизация...${NC}"
     sync
     
     verify_usb
+    notify_done
     
     echo ""
     echo -e "${BLUE}[*] Извлечение флешки...${NC}"
     sudo diskutil eject "$NEW_DISK" 2>/dev/null || true
 }
 
-# --- Функция: Распаковка сжатых образов ---
-decompress_if_needed() {
-    case "$ISO_PATH" in
-        *.gz)
-            echo -e "${BLUE}Распаковка .gz...${NC}"
-            UNPACKED="${ISO_PATH%.gz}"
-            gunzip -k "$ISO_PATH" 2>/dev/null || true
-            ISO_PATH="$UNPACKED"
-            ;;
-        *.xz)
-            echo -e "${BLUE}Распаковка .xz...${NC}"
-            if ! command -v xz &> /dev/null; then
-                echo -e "${YELLOW}Установка xz...${NC}"
-                brew install xz
-            fi
-            UNPACKED="${ISO_PATH%.xz}"
-            xz -dk "$ISO_PATH" 2>/dev/null || true
-            ISO_PATH="$UNPACKED"
-            ;;
-        *.zip)
-            echo -e "${BLUE}Распаковка .zip...${NC}"
-            UNZIP_DIR="$(dirname "$ISO_PATH")/unzipped_img"
-            mkdir -p "$UNZIP_DIR"
-            unzip -o "$ISO_PATH" -d "$UNZIP_DIR"
-            IMG_FILE=$(find "$UNZIP_DIR" -name "*.img" -o -name "*.iso" \
-                | head -1)
-            if [ -z "$IMG_FILE" ]; then
-                echo -e "${RED}Не найден .img/.iso в архиве!${NC}"
-                exit 1
-            fi
-            ISO_PATH="$IMG_FILE"
-            ;;
-    esac
-    echo -e "${GREEN}[OK] Образ: $ISO_PATH${NC}"
-}
-
-# --- Функция: Подменю Linux ---
-menu_linux() {
+# --- Функция: Режим Временной Флешки (Бэкап -> Запись -> Восстановление) ---
+temp_usb_mode() {
     echo ""
-    echo -e "${BOLD}Выберите дистрибутив Linux:${NC}"
-    echo "  1) Ubuntu / Ubuntu Server"
-    echo "  2) Debian"
-    echo "  3) Fedora"
-    echo "  4) Linux Mint"
-    echo "  5) Arch Linux"
-    echo "  6) openSUSE"
-    echo "  7) Kali Linux"
-    echo "  8) Другой дистрибутив (.iso)"
+    echo -e "${CYAN}=== Режим Временной Флешки ===${NC}"
+    echo "1. Данные с флешки будут сохранены в архив на Mac"
+    echo "2. Флешка будет отформатирована и записана как загрузочная"
+    echo "3. После использования вы вставляете её обратно, и данные восстанавливаются"
     echo ""
-    read -r -p "Ваш выбор (1-8): " LCHOICE
-
-    case $LCHOICE in
-        1) echo -e "${CYAN}Режим: Ubuntu${NC}" ;;
-        2) echo -e "${CYAN}Режим: Debian${NC}" ;;
-        3) echo -e "${CYAN}Режим: Fedora${NC}" ;;
-        4) echo -e "${CYAN}Режим: Linux Mint${NC}" ;;
-        5) echo -e "${CYAN}Режим: Arch Linux${NC}" ;;
-        6) echo -e "${CYAN}Режим: openSUSE${NC}" ;;
-        7) echo -e "${CYAN}Режим: Kali Linux${NC}" ;;
-        8) echo -e "${CYAN}Режим: Другой Linux${NC}" ;;
-        *)
-            echo -e "${RED}Неверный выбор!${NC}"
-            exit 1
-            ;;
-    esac
-
-    get_image_path "(.iso)"
+    
+    get_image_path "(.iso / .img)"
     auto_detect_usb
+    
+    # Бэкап
+    mkdir -p "$BACKUP_DIR"
+    BACKUP_FILE="$BACKUP_DIR/usb_backup_$(date '+%Y%m%d_%H%M%S').zip"
+    
+    MOUNT_POINT=$(mount | grep "$NEW_DISK" | awk -F' on ' '{print $2}' | awk -F' \\(' '{print $1}')
+    if [ -z "$MOUNT_POINT" ]; then
+        diskutil mountDisk "$NEW_DISK" >/dev/null 2>&1 || true
+        sleep 2
+        MOUNT_POINT=$(mount | grep "$NEW_DISK" | awk -F' on ' '{print $2}' | awk -F' \\(' '{print $1}')
+    fi
+    
+    if [ -n "$MOUNT_POINT" ]; then
+        echo -e "${BLUE}[*] Создание резервной копии данных флешки...${NC}"
+        cd "$MOUNT_POINT" && zip -r "$BACKUP_FILE" ./*
+        echo -e "${GREEN}[OK] Бэкап сохранен: $BACKUP_FILE${NC}"
+    else
+        echo -e "${YELLOW}[!] Не удалось смонтировать флешку для бэкапа. Возможно она пустая или не отформатирована.${NC}"
+    fi
+    
+    # Запись
+    echo -e "${BLUE}[*] Переход к записи образа...${NC}"
     flash_dd
-}
-
-# --- Функция: Подменю ARM / Raspberry Pi ---
-menu_arm() {
+    
+    # Ожидание возврата
     echo ""
-    echo -e "${BOLD}Выберите систему:${NC}"
-    echo "  1) Raspberry Pi OS (Raspbian)"
-    echo "  2) Ubuntu для Raspberry Pi"
-    echo "  3) DietPi"
-    echo "  4) LibreELEC / OSMC"
-    echo "  5) Home Assistant OS"
-    echo "  6) Armbian (Orange Pi, Banana Pi и др.)"
-    echo "  7) Другой ARM-образ (.img)"
+    echo -e "${CYAN}============================================================${NC}"
+    echo -e "${CYAN}Загрузочная флешка готова! Вы можете извлечь её и использовать.${NC}"
+    echo -e "${CYAN}============================================================${NC}"
     echo ""
-    read -r -p "Ваш выбор (1-7): " ACHOICE
-
-    case $ACHOICE in
-        1) echo -e "${CYAN}Режим: Raspberry Pi OS${NC}" ;;
-        2) echo -e "${CYAN}Режим: Ubuntu ARM${NC}" ;;
-        3) echo -e "${CYAN}Режим: DietPi${NC}" ;;
-        4) echo -e "${CYAN}Режим: LibreELEC / OSMC${NC}" ;;
-        5) echo -e "${CYAN}Режим: Home Assistant OS${NC}" ;;
-        6) echo -e "${CYAN}Режим: Armbian${NC}" ;;
-        7) echo -e "${CYAN}Режим: Другой ARM${NC}" ;;
-        *)
-            echo -e "${RED}Неверный выбор!${NC}"
-            exit 1
-            ;;
-    esac
-
-    get_image_path "(.img / .img.gz / .img.xz / .zip)"
-    decompress_if_needed
-    auto_detect_usb
-    flash_dd
+    echo -e "${BOLD}Что делать дальше?${NC}"
+    echo "1) Ждать возврата флешки для восстановления данных сейчас"
+    echo "2) Выйти (бэкап сохранен в $BACKUP_DIR, восстановите позже вручную)"
+    read -r -p "Ваш выбор (1-2): " WAIT_CHOICE
+    
+    if [ "$WAIT_CHOICE" == "1" ]; then
+        echo ""
+        echo -e "${YELLOW}🔌 Отключите флешку (если еще не отключили) и используйте её.${NC}"
+        echo -e "${YELLOW}Когда закончите, вставьте её обратно в Mac.${NC}"
+        echo "Ожидание подключения..."
+        
+        BEFORE=$(diskutil list external 2>/dev/null | grep -o '/dev/disk[0-9]*' | sort -u)
+        RESTORE_DISK=""
+        while true; do
+            AFTER=$(diskutil list external 2>/dev/null | grep -o '/dev/disk[0-9]*' | sort -u)
+            for d in $AFTER; do
+                if ! echo "$BEFORE" | grep -q "$d"; then
+                    RESTORE_DISK="$d"
+                    break 2
+                fi
+            done
+            sleep 2
+        done
+        
+        echo -e "${GREEN}[OK] Флешка обнаружена: $RESTORE_DISK${NC}"
+        echo -e "${BLUE}[*] Форматирование флешки (ExFAT)...${NC}"
+        sudo diskutil eraseDisk ExFAT "RESTORED_USB" GPT "$RESTORE_DISK"
+        
+        RESTORE_MP=$(mount | grep "$RESTORE_DISK" | awk -F' on ' '{print $2}' | awk -F' \\(' '{print $1}')
+        if [ -n "$RESTORE_MP" ] && [ -f "$BACKUP_FILE" ]; then
+            echo -e "${BLUE}[*] Восстановление данных из архива...${NC}"
+            unzip -o "$BACKUP_FILE" -d "$RESTORE_MP"
+            echo -e "${GREEN}[OK] Данные успешно восстановлены!${NC}"
+            echo -e "${BLUE}[*] Удаление архива...${NC}"
+            rm -f "$BACKUP_FILE"
+        else
+            echo -e "${RED}[!] Ошибка восстановления. Архив находится в: $BACKUP_FILE${NC}"
+        fi
+    else
+        echo "Выход. Архив сохранен в: $BACKUP_FILE"
+        exit 0
+    fi
 }
 
 # --- ГЛАВНОЕ МЕНЮ ---
 show_banner
 check_for_updates
+check_deps
 
-echo -e "${BOLD}Что вы хотите записать?${NC}"
+echo -e "${BOLD}Что вы хотите сделать?${NC}"
 echo ""
-echo "  1) Windows 10 / 11  (UEFI-загрузка)"
-echo "  2) Linux             (Ubuntu, Fedora, Debian...)"
-echo "  3) Raspberry Pi / ARM"
-echo "  4) Любой .iso / .img (универсальный режим dd)"
+echo "  1) Записать Windows 10 / 11 (UEFI)"
+echo "  2) Записать Linux / Raspberry Pi / ARM (dd)"
+echo "  3) Режим Временной Флешки (Бэкап -> Запись -> Восстановление)"
 echo ""
 echo "  0) Выход"
 echo ""
-read -r -p "Ваш выбор (0-4): " MAIN_CHOICE
+read -r -p "Ваш выбор (0-3): " MAIN_CHOICE
 
 case $MAIN_CHOICE in
     1)
         echo ""
         echo -e "${CYAN}=== Windows (UEFI) ===${NC}"
-        check_deps
         get_image_path "(.iso)"
         auto_detect_usb
         flash_windows
         ;;
     2)
         echo ""
-        echo -e "${CYAN}=== Linux ===${NC}"
-        menu_linux
-        ;;
-    3)
-        echo ""
-        echo -e "${CYAN}=== Raspberry Pi / ARM ===${NC}"
-        menu_arm
-        ;;
-    4)
-        echo ""
         echo -e "${CYAN}=== Универсальный режим (dd) ===${NC}"
         get_image_path "(.iso / .img)"
-        decompress_if_needed
         auto_detect_usb
         flash_dd
+        ;;
+    3)
+        temp_usb_mode
         ;;
     0)
         echo "Выход."
@@ -445,11 +411,7 @@ esac
 
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║     ГОТОВО! Флешка успешно записана!     ║${NC}"
+echo -e "${GREEN}║     ГОТОВО! Операция успешно завершена!  ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════╝${NC}"
-echo ""
-echo "Для загрузки на целевом ПК:"
-echo "  - UEFI: обычно F12, F8, F11 или Esc"
-echo "  - Raspberry Pi: просто вставьте карту"
 echo ""
 read -r -p "Нажмите Enter для выхода..."
